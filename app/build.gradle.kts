@@ -12,7 +12,7 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 1
-        versionName = "1.0"
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -20,13 +20,38 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            val keystoreFile = project.findProperty("KEYSTORE_FILE") as? String
+                ?: System.getenv("KEYSTORE_FILE")
+            if (keystoreFile != null && file(keystoreFile).exists()) {
+                storeFile = file(keystoreFile)
+                storePassword = project.findProperty("KEYSTORE_PASSWORD") as? String
+                    ?: System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = project.findProperty("KEY_ALIAS") as? String
+                    ?: System.getenv("KEY_ALIAS")
+                keyPassword = project.findProperty("KEY_PASSWORD") as? String
+                    ?: System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            isMinifyEnabled = false
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            val releaseSigning = signingConfigs.getByName("release")
+            if (releaseSigning.storeFile != null) {
+                signingConfig = releaseSigning
+            }
         }
     }
 
@@ -41,10 +66,18 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.14"
+    }
+
+    testOptions {
+        unitTests {
+            isReturnDefaultValues = true
+            isIncludeAndroidResources = true
+        }
     }
 
     packaging {
@@ -88,6 +121,8 @@ dependencies {
 
     // Unit & Instrumentation Testing
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    testImplementation("org.json:json:20240303")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")

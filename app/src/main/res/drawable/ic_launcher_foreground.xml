@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Touch Blocker Shield / Screen Vector -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M54,20L28,32v24c0,16.5 11.1,31.9 26,36c14.9,-4.1 26,-19.5 26,-36V32L54,20z" />
+    <path
+        android:fillColor="#0284C7"
+        android:pathData="M54,23.5L31,34.1v21.9c0,14.6 9.8,28.2 23,31.8V23.5z" />
+    <!-- Touch Hand / Lock Overlay Symbol -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,42c-4.4,0 -8,3.6 -8,8v4h-2c-1.1,0 -2,0.9 -2,2v14c0,1.1 0.9,2 2,2h20c1.1,0 2,-0.9 2,-2V56c0,-1.1 -0.9,-2 -2,-2h-2v-4C62,45.6 58.4,42 54,42z M54,45.5c2.5,0 4.5,2 4.5,4.5v4h-9v-4C49.5,47.5 51.5,45.5 54,45.5z" />
+</vector>

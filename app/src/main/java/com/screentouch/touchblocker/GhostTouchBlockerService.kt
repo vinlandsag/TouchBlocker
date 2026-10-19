@@ -1,5 +1,6 @@
 package com.screentouch.touchblocker
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -17,39 +18,32 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import android.view.Gravity
+import android.view.View
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
-import com.screentouch.touchblocker.data.BlockZone
 import com.screentouch.touchblocker.data.BlockZoneRepository
-import com.screentouch.touchblocker.overlay.TouchOverlayView
 import com.screentouch.touchblocker.util.PermissionUtils
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Foreground Service responsible for managing touch-blocking overlay windows.
- * Extends [LifecycleService] and operates as an Android 14 (API 34) specialUse service.
+ * Foreground Service that manages touch-blocking overlays using [WindowManager].
+ *
+ * Prevents accidental full-screen blocking by requiring configured zone bounds or explicit
+ * user confirmation. Keeps persistent notification, Quick Settings tile, and app UI synchronized.
  */
 class GhostTouchBlockerService : LifecycleService() {
 
     private val binder = LocalBinder()
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var windowManager: WindowManager? = null
+    private lateinit var windowManager: WindowManager
+    private lateinit var repository: BlockZoneRepository
 
-    /**
-     * Data class holding an active overlay view and its associated WindowManager configuration.
-     */
-    data class BlockZoneEntry(
-        val id: String,
-        val view: TouchOverlayView,
-        val layoutParams: WindowManager.LayoutParams,
-        var rect: Rect
-    )
-
-    // Map maintaining active overlay views added to WindowManager keyed by zone ID
-    private val activeZones = ConcurrentHashMap<String, BlockZoneEntry>()
+    // Active overlay views keyed by zoneId
+    private val activeViews = ConcurrentHashMap<String, View>()
 
     companion object {
         private const val TAG = "GhostTouchBlocker"
@@ -57,82 +51,88 @@ class GhostTouchBlockerService : LifecycleService() {
         private const val NOTIFICATION_ID = 1001
 
         // Intent Actions
-        const val ACTION_START = "com.screentouch.touchblocker.ACTION_START"
-        const val ACTION_STOP = "com.screentouch.touchblocker.ACTION_STOP"
-        const val ACTION_ADD_ZONE = "com.screentouch.touchblocker.ACTION_ADD_ZONE"
-        const val ACTION_UPDATE_ZONE = "com.screentouch.touchblocker.ACTION_UPDATE_ZONE"
-        const val ACTION_REMOVE_ZONE = "com.screentouch.touchblocker.ACTION_REMOVE_ZONE"
-        const val ACTION_REMOVE_ALL_ZONES = "com.screentouch.touchblocker.ACTION_REMOVE_ALL_ZONES"
+        const val ACTION = "ACTION"
+        const val ACTION_START = "START"
+        const val ACTION_APPLY_ZONE = "APPLY_ZONE"
+        const val ACTION_STOP_SERVICE = "STOP_SERVICE"
+        const val ACTION_TOGGLE_PROTECTION = "TOGGLE_PROTECTION"
+        const val ACTION_REMOVE_ZONE = "REMOVE_ZONE"
 
         // Intent Extras
-        const val EXTRA_ZONE_ID = "extra_zone_id"
-        const val EXTRA_ZONE_RECT = "extra_zone_rect"
-        const val EXTRA_ZONE_COLOR = "extra_zone_color"
-        const val EXTRA_ZONE_ALPHA = "extra_zone_alpha"
+        const val EXTRA_ZONE_ID = "ZONE_ID"
+        const val RECT_LEFT = "RECT_LEFT"
+        const val RECT_TOP = "RECT_TOP"
+        const val RECT_RIGHT = "RECT_RIGHT"
+        const val RECT_BOTTOM = "RECT_BOTTOM"
+        const val IS_EDIT_MODE = "IS_EDIT_MODE"
+        const val EXTRA_CONFIRM_FULLSCREEN = "CONFIRM_FULLSCREEN"
+
+        const val DEFAULT_ZONE_ID = "primary_zone"
 
         /**
-         * Starts the GhostTouchBlockerService in the foreground.
+         * Applies or updates a block zone.
          */
-        fun start(context: Context) {
+        fun applyZone(
+            context: Context,
+            bounds: Rect,
+            isEditMode: Boolean = false,
+            zoneId: String = DEFAULT_ZONE_ID
+        ) {
             val intent = Intent(context, GhostTouchBlockerService::class.java).apply {
-                action = ACTION_START
+                putExtra(ACTION, ACTION_APPLY_ZONE)
+                putExtra(EXTRA_ZONE_ID, zoneId)
+                putExtra(RECT_LEFT, bounds.left)
+                putExtra(RECT_TOP, bounds.top)
+                putExtra(RECT_RIGHT, bounds.right)
+                putExtra(RECT_BOTTOM, bounds.bottom)
+                putExtra(IS_EDIT_MODE, isEditMode)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            startServiceCompat(context, intent)
+        }
+
+        /**
+         * Starts protection using saved zones or explicitly confirmed full screen.
+         */
+        fun start(context: Context, confirmFullScreen: Boolean = false) {
+            val intent = Intent(context, GhostTouchBlockerService::class.java).apply {
+                putExtra(ACTION, ACTION_START)
+                putExtra(EXTRA_CONFIRM_FULLSCREEN, confirmFullScreen)
             }
+            startServiceCompat(context, intent)
         }
 
         fun startService(context: Context) = start(context)
 
         /**
-         * Stops the GhostTouchBlockerService and dismisses all overlays.
+         * Stops protection, removes overlays, persists inactive state, and shuts down service.
          */
         fun stop(context: Context) {
             val intent = Intent(context, GhostTouchBlockerService::class.java).apply {
-                action = ACTION_STOP
+                putExtra(ACTION, ACTION_STOP_SERVICE)
             }
             context.startService(intent)
         }
 
         fun stopService(context: Context) = stop(context)
 
-        /**
-         * Sends an intent to add a block zone.
-         */
-        fun addZone(context: Context, id: String, rect: Rect) {
+        fun addZone(context: Context, id: String, rect: Rect, isEditMode: Boolean = false) {
+            applyZone(context, rect, isEditMode, id)
+        }
+
+        fun removeZone(context: Context, id: String) {
             val intent = Intent(context, GhostTouchBlockerService::class.java).apply {
-                action = ACTION_ADD_ZONE
+                putExtra(ACTION, ACTION_REMOVE_ZONE)
                 putExtra(EXTRA_ZONE_ID, id)
-                putExtra(EXTRA_ZONE_RECT, rect)
             }
+            context.startService(intent)
+        }
+
+        private fun startServiceCompat(context: Context, intent: Intent) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
             } else {
                 context.startService(intent)
             }
-        }
-
-        /**
-         * Sends an intent to remove a specific block zone.
-         */
-        fun removeZone(context: Context, id: String) {
-            val intent = Intent(context, GhostTouchBlockerService::class.java).apply {
-                action = ACTION_REMOVE_ZONE
-                putExtra(EXTRA_ZONE_ID, id)
-            }
-            context.startService(intent)
-        }
-
-        /**
-         * Sends an intent to remove all block zones.
-         */
-        fun removeAll(context: Context) {
-            val intent = Intent(context, GhostTouchBlockerService::class.java).apply {
-                action = ACTION_REMOVE_ALL_ZONES
-            }
-            context.startService(intent)
         }
     }
 
@@ -148,225 +148,237 @@ class GhostTouchBlockerService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        repository = BlockZoneRepository.getInstance(applicationContext)
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-
-        // Construct and start persistent foreground notification using "GHOST_BLOCKER_CHANNEL"
-        startForegroundNotification()
-
         intent?.let { handleIntent(it) }
-
         return START_STICKY
     }
 
     private fun handleIntent(intent: Intent) {
-        when (intent.action) {
-            ACTION_START -> {
+        val action = intent.getStringExtra(ACTION) ?: intent.action
+
+        when (action) {
+            ACTION_STOP_SERVICE, "com.screentouch.touchblocker.ACTION_STOP" -> {
+                shutdownProtection()
+            }
+            ACTION_TOGGLE_PROTECTION -> {
                 lifecycleScope.launch {
-                    val repository = BlockZoneRepository.getInstance(applicationContext)
-                    repository.setProtectionActive(true)
-                    val savedZones = repository.getEnabledZones()
-                    if (savedZones.isNotEmpty()) {
-                        for (zone in savedZones) {
-                            addBlockZone(zone.id, zone.toRect(), zone.color, zone.alpha)
-                        }
-                    } else if (activeZones.isEmpty()) {
-                        val displayMetrics = resources.displayMetrics
-                        val fullScreenRect = Rect(0, 0, displayMetrics.widthPixels, displayMetrics.heightPixels)
-                        addBlockZone("default_fullscreen", fullScreenRect)
+                    val isActive = repository.isProtectionActiveFlowValue()
+                    if (isActive) {
+                        pauseProtectionFromNotification()
+                    } else {
+                        restoreOrStartProtection(confirmFullScreen = false)
                     }
                 }
             }
-            ACTION_STOP -> {
-                removeAllZones()
-                stopForegroundService()
-            }
-            ACTION_ADD_ZONE -> {
-                val id = intent.getStringExtra(EXTRA_ZONE_ID)
-                @Suppress("DEPRECATION")
-                val rect = intent.getParcelableExtra<Rect>(EXTRA_ZONE_RECT)
-                val color = intent.getIntExtra(EXTRA_ZONE_COLOR, Color.RED)
-                val alpha = intent.getFloatExtra(EXTRA_ZONE_ALPHA, 0.35f)
-                if (id != null && rect != null) {
-                    addBlockZone(id, rect, color, alpha)
-                }
-            }
-            ACTION_UPDATE_ZONE -> {
-                val id = intent.getStringExtra(EXTRA_ZONE_ID)
-                @Suppress("DEPRECATION")
-                val rect = intent.getParcelableExtra<Rect>(EXTRA_ZONE_RECT)
-                if (id != null && rect != null) {
-                    updateBlockZone(id, rect)
+            ACTION_APPLY_ZONE -> {
+                val zoneId = intent.getStringExtra(EXTRA_ZONE_ID) ?: DEFAULT_ZONE_ID
+                val left = intent.getIntExtra(RECT_LEFT, 0)
+                val top = intent.getIntExtra(RECT_TOP, 0)
+                val right = intent.getIntExtra(RECT_RIGHT, 0)
+                val bottom = intent.getIntExtra(RECT_BOTTOM, 0)
+                val isEditMode = intent.getBooleanExtra(IS_EDIT_MODE, false)
+
+                if (right > left && bottom > top) {
+                    val bounds = Rect(left, top, right, bottom)
+                    applyBlockingZone(zoneId, bounds, isEditMode)
+                } else {
+                    Log.w(TAG, "Invalid bounds received for zone $zoneId: [$left, $top, $right, $bottom]")
                 }
             }
             ACTION_REMOVE_ZONE -> {
-                val id = intent.getStringExtra(EXTRA_ZONE_ID)
-                if (id != null) {
-                    removeBlockZone(id)
+                val zoneId = intent.getStringExtra(EXTRA_ZONE_ID) ?: DEFAULT_ZONE_ID
+                removeZone(zoneId)
+                if (activeViews.isEmpty()) {
+                    shutdownProtection()
                 }
             }
-            ACTION_REMOVE_ALL_ZONES -> {
-                removeAllZones()
+            ACTION_START, null -> {
+                val confirmFullScreen = intent.getBooleanExtra(EXTRA_CONFIRM_FULLSCREEN, false)
+                restoreOrStartProtection(confirmFullScreen)
+            }
+            else -> {
+                restoreOrStartProtection(confirmFullScreen = false)
             }
         }
     }
 
     /**
-     * Adds a touch block zone overlay at the specified [rect] coordinates.
-     *
-     * WindowManager layout params:
-     * - width = rect.width()
-     * - height = rect.height()
-     * - x = rect.left
-     * - y = rect.top
-     * - type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-     * - flags = FLAG_NOT_FOCUSABLE or FLAG_NOT_TOUCH_MODAL or FLAG_LAYOUT_IN_SCREEN
-     * - format = PixelFormat.TRANSLUCENT
-     * - gravity = Gravity.TOP or Gravity.LEFT
-     *
-     * @param id Unique identifier for the block zone.
-     * @param rect Bounding rectangle on the screen for the block zone.
-     * @param color Optional visual debug color (default: Color.RED).
-     * @param alpha Optional transparency level (default: 0.35f).
+     * Attempts to start protection using configured zones.
+     * Prevents accidental full-screen blocking if no zone has been configured.
      */
-    fun addBlockZone(
-        id: String,
-        rect: Rect,
-        color: Int = Color.RED,
-        alpha: Float = 0.35f
+    private fun restoreOrStartProtection(confirmFullScreen: Boolean) {
+        lifecycleScope.launch {
+            val savedZone = repository.getSavedZone()
+            if (savedZone != null) {
+                applyBlockingZone(DEFAULT_ZONE_ID, savedZone, isEditMode = false)
+                return@launch
+            }
+
+            val enabledZones = repository.getEnabledZones()
+            if (enabledZones.isNotEmpty()) {
+                for (zone in enabledZones) {
+                    applyBlockingZone(zone.id, zone.toRect(), isEditMode = false)
+                }
+                return@launch
+            }
+
+            if (confirmFullScreen) {
+                Log.w(TAG, "Full screen blocking explicitly confirmed by user.")
+                val displayMetrics = resources.displayMetrics
+                val fullScreen = Rect(0, 0, displayMetrics.widthPixels, displayMetrics.heightPixels)
+                applyBlockingZone("fullscreen_confirmed", fullScreen, isEditMode = false)
+            } else {
+                Log.w(TAG, "No block zone configured. Aborting startup to prevent accidental full-screen lockouts.")
+                shutdownProtection()
+            }
+        }
+    }
+
+    /**
+     * Adds or updates a touch-blocking overlay.
+     */
+    @SuppressLint("ClickableViewAccessibility")
+    fun applyBlockingZone(
+        zoneId: String,
+        bounds: Rect,
+        isEditMode: Boolean = false
     ) {
         runOnMainThread {
             if (!PermissionUtils.hasOverlayPermission(this)) {
-                Log.e(TAG, "Cannot add block zone $id: Overlay permission not granted.")
+                Log.e(TAG, "Cannot apply blocking zone $zoneId: Overlay permission revoked.")
+                shutdownProtection()
                 return@runOnMainThread
             }
 
-            // If a zone with this id already exists, update its position and size
-            if (activeZones.containsKey(id)) {
-                updateBlockZone(id, rect)
-                return@runOnMainThread
-            }
+            // Ensure foreground notification is running and synchronized
+            startForegroundNotification(activeZoneCount = activeViews.size + 1)
 
-            val overlayView = TouchOverlayView(this).apply {
-                overlayColor = color
-                overlayAlpha = alpha
-            }
-
-            val layoutParams = WindowManager.LayoutParams().apply {
-                width = rect.width()
-                height = rect.height()
-                x = rect.left
-                y = rect.top
-                type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            val layoutParams = WindowManager.LayoutParams(
+                bounds.width(),
+                bounds.height(),
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                         WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                format = PixelFormat.TRANSLUCENT
-                gravity = Gravity.TOP or Gravity.LEFT
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                x = bounds.left
+                y = bounds.top
             }
 
-            try {
-                windowManager?.addView(overlayView, layoutParams)
-                activeZones[id] = BlockZoneEntry(
-                    id = id,
-                    view = overlayView,
-                    layoutParams = layoutParams,
-                    rect = Rect(rect)
-                )
-                Log.d(TAG, "Added block zone '$id' at $rect (total active: ${activeZones.size})")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to add block zone '$id' to WindowManager", e)
-            }
-        }
-    }
-
-    /**
-     * Updates an existing block zone's bounds to [rect].
-     *
-     * @param id Unique identifier of the block zone to update.
-     * @param rect New rectangle coordinates and dimensions.
-     */
-    fun updateBlockZone(id: String, rect: Rect) {
-        runOnMainThread {
-            val entry = activeZones[id]
-            if (entry == null) {
-                // If zone does not exist yet, add it
-                addBlockZone(id, rect)
-                return@runOnMainThread
+            // Reddish highlight in edit mode (#44FF0000), Completely transparent during active blocking
+            val backgroundColor = if (isEditMode) {
+                Color.parseColor("#44FF0000")
+            } else {
+                Color.TRANSPARENT
             }
 
-            entry.layoutParams.apply {
-                width = rect.width()
-                height = rect.height()
-                x = rect.left
-                y = rect.top
-            }
-            entry.rect = Rect(rect)
-
-            try {
-                windowManager?.updateViewLayout(entry.view, entry.layoutParams)
-                Log.d(TAG, "Updated block zone '$id' to $rect")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to update block zone '$id'", e)
-            }
-        }
-    }
-
-    /**
-     * Removes an active block zone overlay from WindowManager by its [id].
-     *
-     * @param id Unique identifier of the block zone to remove.
-     */
-    fun removeBlockZone(id: String) {
-        runOnMainThread {
-            val entry = activeZones.remove(id)
-            if (entry != null) {
+            if (activeViews.containsKey(zoneId)) {
+                val existingView = activeViews[zoneId]!!
+                existingView.setBackgroundColor(backgroundColor)
                 try {
-                    windowManager?.removeView(entry.view)
-                    Log.d(TAG, "Removed block zone '$id' (remaining active: ${activeZones.size})")
+                    windowManager.updateViewLayout(existingView, layoutParams)
+                    Log.d(TAG, "Updated block zone '$zoneId' at $bounds, editMode=$isEditMode")
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to remove block zone '$id' from WindowManager", e)
+                    Log.e(TAG, "Failed to update layout for zone '$zoneId'", e)
                 }
             } else {
-                Log.w(TAG, "Block zone '$id' not found in active zones.")
+                val overlayView = View(this).apply {
+                    setBackgroundColor(backgroundColor)
+                    // Consume all touch events
+                    setOnTouchListener { _, _ -> true }
+                }
+                try {
+                    windowManager.addView(overlayView, layoutParams)
+                    activeViews[zoneId] = overlayView
+                    Log.d(TAG, "Added block zone '$zoneId' at $bounds, editMode=$isEditMode")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to add block zone '$zoneId'", e)
+                }
+            }
+
+            // Persist active state in repository
+            lifecycleScope.launch {
+                repository.setProtectionActive(true)
+                if (!isEditMode) {
+                    repository.saveZoneBounds(bounds, isEditMode = false)
+                }
             }
         }
     }
 
     /**
-     * Removes all active block zone overlay views from WindowManager and clears the registry.
+     * Removes a specific block zone.
+     */
+    fun removeZone(zoneId: String) {
+        runOnMainThread {
+            activeViews[zoneId]?.let { view ->
+                try {
+                    windowManager.removeView(view)
+                    activeViews.remove(zoneId)
+                    Log.d(TAG, "Removed zone '$zoneId'")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to remove zone view '$zoneId'", e)
+                }
+            }
+        }
+    }
+
+    /**
+     * Removes all active overlays.
      */
     fun removeAllZones() {
         runOnMainThread {
-            activeZones.forEach { (id, entry) ->
+            activeViews.forEach { (id, view) ->
                 try {
-                    windowManager?.removeView(entry.view)
-                    Log.d(TAG, "Removed block zone '$id'")
+                    windowManager.removeView(view)
+                    Log.d(TAG, "Removed overlay for zone '$id'")
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to remove view for zone '$id'", e)
                 }
             }
-            activeZones.clear()
-            Log.d(TAG, "All block zones removed.")
+            activeViews.clear()
         }
     }
 
     /**
-     * Returns a snapshot list of all currently active block zone entries.
+     * Centralized stop path: persists inactive state, removes all overlays,
+     * stops the foreground notification, and terminates the service.
      */
-    fun getActiveZones(): List<BlockZoneEntry> = activeZones.values.toList()
+    private fun shutdownProtection() {
+        runOnMainThread {
+            lifecycleScope.launch {
+                repository.setProtectionActive(false)
+                removeAllZones()
+                stopForegroundService()
+            }
+        }
+    }
 
-    /**
-     * Constructs and initiates the persistent foreground notification.
-     */
-    private fun startForegroundNotification() {
-        val notification = buildForegroundNotification()
+    /** Pauses overlays but leaves a dismissible notification with a resume action. */
+    private fun pauseProtectionFromNotification() {
+        runOnMainThread {
+            lifecycleScope.launch {
+                repository.setProtectionActive(false)
+                removeAllZones()
+                startForegroundNotification(activeZoneCount = 0, protectionActive = false)
+                stopForeground(STOP_FOREGROUND_DETACH)
+                stopSelf()
+            }
+        }
+    }
+
+    private fun startForegroundNotification(activeZoneCount: Int, protectionActive: Boolean = true) {
+        val notification = buildForegroundNotification(activeZoneCount, protectionActive)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            // Android 14 (API 34) Special Use foreground service type
             startForeground(
                 NOTIFICATION_ID,
                 notification,
@@ -377,7 +389,29 @@ class GhostTouchBlockerService : LifecycleService() {
         }
     }
 
-    private fun buildForegroundNotification(): Notification {
+
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                "Ghost Touch Blocker Channel",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Persistent notification indicating active touch blocker overlay"
+                setShowBadge(false)
+            }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(channel)
+        }
+    }
+    /**
+     * Builds the persistent foreground notification with actions to pause and toggle protection.
+     */
+    private fun buildForegroundNotification(
+        activeZoneCount: Int = 1,
+        protectionActive: Boolean = true
+    ): Notification {
         val launchIntent = Intent(this, MainActivity::class.java).let {
             PendingIntent.getActivity(
                 this,
@@ -387,8 +421,9 @@ class GhostTouchBlockerService : LifecycleService() {
             )
         }
 
+        // Action to pause/stop protection
         val stopIntent = Intent(this, GhostTouchBlockerService::class.java).apply {
-            action = ACTION_STOP
+            putExtra(ACTION, ACTION_STOP_SERVICE)
         }
         val stopPendingIntent = PendingIntent.getService(
             this,
@@ -397,37 +432,46 @@ class GhostTouchBlockerService : LifecycleService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        // Action to toggle protection on/off
+        val toggleIntent = Intent(this, GhostTouchBlockerService::class.java).apply {
+            putExtra(ACTION, ACTION_TOGGLE_PROTECTION)
+        }
+        val togglePendingIntent = PendingIntent.getForegroundService(
+            this,
+            2,
+            toggleIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val contentText = if (!protectionActive) {
+            "Protection is off. Tap Turn On to resume your saved zone."
+        } else if (activeZoneCount > 1) {
+            "Blocking touches in $activeZoneCount active zones."
+        } else {
+            "Blocking touches in configured zone."
+        }
+
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("Ghost Touch Blocker Active")
-            .setContentText("Screen touch blocking overlays are active.")
+            .setContentTitle(if (protectionActive) "Touch Blocker Active" else "Touch Blocker Paused")
+            .setContentText(contentText)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setOngoing(true)
+            .setOngoing(protectionActive)
             .setContentIntent(launchIntent)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop All", stopPendingIntent)
+            .addAction(
+                if (protectionActive) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
+                if (protectionActive) "Turn Off Protection" else "Turn On Protection",
+                togglePendingIntent
+            )
+            .apply {
+                if (protectionActive) {
+                    addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop and Dismiss", stopPendingIntent)
+                }
+            }
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
     }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL_ID,
-                "Ghost Touch Blocker Service Channel",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Persistent notification channel for Ghost Touch Blocker overlay service"
-                setShowBadge(false)
-            }
-            val notificationManager = getSystemService(NotificationManager::class.java)
-            notificationManager?.createNotificationChannel(channel)
-        }
-    }
-
     private fun stopForegroundService() {
-        lifecycleScope.launch {
-            BlockZoneRepository.getInstance(applicationContext).setProtectionActive(false)
-        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
@@ -435,6 +479,10 @@ class GhostTouchBlockerService : LifecycleService() {
             stopForeground(true)
         }
         stopSelf()
+    }
+
+    private suspend fun BlockZoneRepository.isProtectionActiveFlowValue(): Boolean {
+        return isProtectionActive.first()
     }
 
     private fun runOnMainThread(action: () -> Unit) {
@@ -446,7 +494,11 @@ class GhostTouchBlockerService : LifecycleService() {
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        // Ensure state is marked inactive and overlays are cleared if service is destroyed
         removeAllZones()
+        lifecycleScope.launch {
+            repository.setProtectionActive(false)
+        }
+        super.onDestroy()
     }
 }

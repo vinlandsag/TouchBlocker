@@ -3,12 +3,11 @@ package com.screentouch.touchblocker.ui
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.graphics.Color as AndroidColor
 import android.graphics.Rect
 import android.os.Build
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,10 +25,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -40,10 +39,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -51,7 +50,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -60,13 +58,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.PathEffect
-import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
@@ -75,76 +69,93 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.screentouch.touchblocker.GhostTouchBlockerService
-import com.screentouch.touchblocker.data.TouchBlockerPreferences
+import com.screentouch.touchblocker.data.BlockZoneRepository
 import com.screentouch.touchblocker.util.PermissionUtils
 import kotlinx.coroutines.launch
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Screen for configuring and positioning the touch blocker zone.
- * Features an interactive canvas with top-left, bottom-right, and center drag handles,
- * accurate DP to screen hardware PX translation, and control panel for service activation.
+ * Interactive Screen for configuring touch blocking regions.
+ *
+ * Provides a resizable and draggable rectangle on screen, converting Compose DP
+ * dimensions to raw screen hardware pixels (px) via [LocalDensity] to eliminate
+ * coordinate mismatch bugs.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ZoneSelectorScreen(
     onNavigateBack: (() -> Unit)? = null,
+    onSaveZone: ((Rect, Boolean) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
+    val density = LocalDensity.current
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
-    val preferences = remember { TouchBlockerPreferences(context) }
+    val repository = remember { BlockZoneRepository.getInstance(context) }
     val snackbarHostState = remember { SnackbarHostState() }
 
-    val isBlockerEnabled by preferences.isBlockerEnabled.collectAsState(initial = false)
-    val savedPresetRect by preferences.savedPresetRect.collectAsState(initial = null)
-    val savedOpacity by preferences.overlayOpacity.collectAsState(initial = 0.35f)
+    val savedBounds by repository.savedBoundsFlow.collectAsState(initial = null)
+    val isProtectionActive by repository.isProtectionActive.collectAsState(initial = false)
 
-    // Opacity slider state (0% to 50% visibility)
-    var overlayOpacity by remember { mutableFloatStateOf(0.35f) }
+    // The preview is a scaled map of the entire display. Fractions keep the selected
+    // region stable when the editor's controls or available layout size change.
+    var leftFraction by remember { mutableStateOf(0.1f) }
+    var topFraction by remember { mutableStateOf(0.38f) }
+    var widthFraction by remember { mutableStateOf(0.8f) }
+    var heightFraction by remember { mutableStateOf(0.22f) }
 
-    LaunchedEffect(savedOpacity) {
-        overlayOpacity = savedOpacity.coerceIn(0f, 0.5f)
-    }
+    // Toggle: Show red highlight during setup (#44FF0000), or test invisible mode
+    var isEditMode by remember { mutableStateOf(true) }
 
-    // Interactive Zone Coordinates in Container PX
-    var rectLeft by remember { mutableFloatStateOf(100f) }
-    var rectTop by remember { mutableFloatStateOf(100f) }
-    var rectRight by remember { mutableFloatStateOf(600f) }
-    var rectBottom by remember { mutableFloatStateOf(800f) }
+    val screenWidthPx = context.resources.displayMetrics.widthPixels.coerceAtLeast(1)
+    val screenHeightPx = context.resources.displayMetrics.heightPixels.coerceAtLeast(1)
 
-    var containerWidthPx by remember { mutableFloatStateOf(1f) }
-    var containerHeightPx by remember { mutableFloatStateOf(1f) }
-    var isInitialized by remember { mutableStateOf(false) }
-
-    val density = LocalDensity.current
-    val displayMetrics = context.resources.displayMetrics
-    val screenHardwareWidthPx = displayMetrics.widthPixels
-    val screenHardwareHeightPx = displayMetrics.heightPixels
-
-    // Scale factors mapping container preview coordinates to actual hardware screen pixels
-    val scaleX = if (containerWidthPx > 0f) screenHardwareWidthPx.toFloat() / containerWidthPx else 1f
-    val scaleY = if (containerHeightPx > 0f) screenHardwareHeightPx.toFloat() / containerHeightPx else 1f
-
-    // Convert container bounds to hardware screen Rect
-    fun getHardwareRect(): Rect {
-        val hLeft = (rectLeft * scaleX).roundToInt().coerceIn(0, screenHardwareWidthPx)
-        val hTop = (rectTop * scaleY).roundToInt().coerceIn(0, screenHardwareHeightPx)
-        val hRight = (rectRight * scaleX).roundToInt().coerceIn(hLeft + 1, screenHardwareWidthPx)
-        val hBottom = (rectBottom * scaleY).roundToInt().coerceIn(hTop + 1, screenHardwareHeightPx)
-        return Rect(hLeft, hTop, hRight, hBottom)
-    }
-
-    // Convert hardware Rect back to container preview coordinates
-    fun loadFromHardwareRect(hRect: Rect) {
-        if (containerWidthPx > 0f && containerHeightPx > 0f) {
-            val invScaleX = containerWidthPx / screenHardwareWidthPx.toFloat()
-            val invScaleY = containerHeightPx / screenHardwareHeightPx.toFloat()
-            rectLeft = (hRect.left * invScaleX).coerceIn(0f, containerWidthPx)
-            rectTop = (hRect.top * invScaleY).coerceIn(0f, containerHeightPx)
-            rectRight = (hRect.right * invScaleX).coerceIn(rectLeft + 20f, containerWidthPx)
-            rectBottom = (hRect.bottom * invScaleY).coerceIn(rectTop + 20f, containerHeightPx)
+    // Load saved bounds on first launch if present
+    LaunchedEffect(savedBounds, screenWidthPx, screenHeightPx) {
+        savedBounds?.let { rect ->
+            leftFraction = (rect.left.toFloat() / screenWidthPx).coerceIn(0f, 0.95f)
+            topFraction = (rect.top.toFloat() / screenHeightPx).coerceIn(0f, 0.95f)
+            widthFraction = (rect.width().toFloat() / screenWidthPx).coerceIn(0.05f, 1f - leftFraction)
+            heightFraction = (rect.height().toFloat() / screenHeightPx).coerceIn(0.05f, 1f - topFraction)
         }
+    }
+
+    // Function to calculate exact screen hardware pixel Rect
+    fun calculateScreenPixelRect(): Rect {
+        val leftPx = (leftFraction * screenWidthPx).roundToInt().coerceIn(0, screenWidthPx - 1)
+        val topPx = (topFraction * screenHeightPx).roundToInt().coerceIn(0, screenHeightPx - 1)
+        val rightPx = ((leftFraction + widthFraction) * screenWidthPx).roundToInt().coerceIn(leftPx + 1, screenWidthPx)
+        val bottomPx = ((topFraction + heightFraction) * screenHeightPx).roundToInt().coerceIn(topPx + 1, screenHeightPx)
+        return Rect(leftPx, topPx, rightPx, bottomPx)
+    }
+
+    fun sendZoneToService(rectPx: Rect, editMode: Boolean) {
+        if (context is Activity && !PermissionUtils.hasOverlayPermission(context)) {
+            PermissionUtils.requestOverlayPermission(context)
+            coroutineScope.launch {
+                snackbarHostState.showSnackbar("Overlay permission is required to activate touch blocking.")
+            }
+            return
+        }
+
+        val intent = Intent(context, GhostTouchBlockerService::class.java).apply {
+            putExtra(GhostTouchBlockerService.ACTION, GhostTouchBlockerService.ACTION_APPLY_ZONE)
+            putExtra(GhostTouchBlockerService.EXTRA_ZONE_ID, GhostTouchBlockerService.DEFAULT_ZONE_ID)
+            putExtra(GhostTouchBlockerService.RECT_LEFT, rectPx.left)
+            putExtra(GhostTouchBlockerService.RECT_TOP, rectPx.top)
+            putExtra(GhostTouchBlockerService.RECT_RIGHT, rectPx.right)
+            putExtra(GhostTouchBlockerService.RECT_BOTTOM, rectPx.bottom)
+            putExtra(GhostTouchBlockerService.IS_EDIT_MODE, editMode)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+
+        onSaveZone?.invoke(rectPx, editMode)
     }
 
     Scaffold(
@@ -152,28 +163,11 @@ fun ZoneSelectorScreen(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
-                title = { Text("Ghost Touch Zone Selector", fontWeight = FontWeight.SemiBold) },
+                title = { Text("Configure Block Zone", fontWeight = FontWeight.SemiBold) },
                 navigationIcon = {
                     if (onNavigateBack != null) {
                         IconButton(onClick = onNavigateBack) {
-                            Icon(Icons.Default.ArrowBack, contentDescription = "Back")
-                        }
-                    }
-                },
-                actions = {
-                    if (savedPresetRect != null) {
-                        OutlinedButton(
-                            onClick = {
-                                savedPresetRect?.let { loadFromHardwareRect(it) }
-                                coroutineScope.launch {
-                                    snackbarHostState.showSnackbar("Loaded saved preset zone")
-                                }
-                            },
-                            modifier = Modifier.padding(end = 8.dp)
-                        ) {
-                            Icon(Icons.Default.Star, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Load Preset", fontSize = 12.sp)
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                         }
                     }
                 },
@@ -188,11 +182,8 @@ fun ZoneSelectorScreen(
                 .fillMaxSize()
                 .padding(paddingValues)
         ) {
-            // Zone Pixel Coordinates HUD
-            val hardwareRect = getHardwareRect()
-            val widthDp = with(density) { ((rectRight - rectLeft) / density.density).dp }
-            val heightDp = with(density) { ((rectBottom - rectTop) / density.density).dp }
-
+            // Real-Time Hardware Pixels HUD
+            val currentRectPx = calculateScreenPixelRect()
             Surface(
                 color = MaterialTheme.colorScheme.surface,
                 tonalElevation = 2.dp,
@@ -207,12 +198,23 @@ fun ZoneSelectorScreen(
                 ) {
                     Column {
                         Text(
-                            text = "Hardware Screen: ${screenHardwareWidthPx} × ${screenHardwareHeightPx} px",
-                            fontSize = 12.sp,
+                            text = "Whole display preview",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.secondary
+                        )
+                        Text(
+                            text = "Drag the box to move it; drag the round handle to resize",
+                            fontSize = 11.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         Text(
-                            text = "Active Rect: [L:${hardwareRect.left}, T:${hardwareRect.top}, R:${hardwareRect.right}, B:${hardwareRect.bottom}] px",
+                            text = "Raw Pixel Bounds (WindowManager):",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = "Rect(L:${currentRectPx.left}, T:${currentRectPx.top}, R:${currentRectPx.right}, B:${currentRectPx.bottom}) px",
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold,
                             fontFamily = FontFamily.Monospace,
@@ -220,7 +222,9 @@ fun ZoneSelectorScreen(
                         )
                     }
                     Text(
-                        text = "${widthDp.value.roundToInt()}dp × ${heightDp.value.roundToInt()}dp",
+                        text = with(density) {
+                            "${currentRectPx.width().toDp().value.roundToInt()}dp × ${currentRectPx.height().toDp().value.roundToInt()}dp"
+                        },
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium,
                         color = MaterialTheme.colorScheme.secondary
@@ -228,156 +232,130 @@ fun ZoneSelectorScreen(
                 }
             }
 
-            // Interactive Screen Representation & Resizable Box
+            // The preview maps edge-to-edge to the device display; its top and bottom
+            // correspond to the physical screen edges, despite the editor controls.
             BoxWithConstraints(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .padding(16.dp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(Color(0xFF1E1E1E))
-                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(12.dp))
-                    .onSizeChanged { size ->
-                        containerWidthPx = size.width.toFloat()
-                        containerHeightPx = size.height.toFloat()
-                        if (!isInitialized && size.width > 0 && size.height > 0) {
-                            // Default box positioned in center-screen
-                            val defaultLeft = size.width * 0.15f
-                            val defaultTop = size.height * 0.2f
-                            val defaultRight = size.width * 0.85f
-                            val defaultBottom = size.height * 0.6f
-                            rectLeft = defaultLeft
-                            rectTop = defaultTop
-                            rectRight = defaultRight
-                            rectBottom = defaultBottom
-                            isInitialized = true
-                        }
-                    }
+                    .background(Color(0xFF222222))
             ) {
-                val minSizePx = with(density) { 48.dp.toPx() }
+                val availableWidthPx = constraints.maxWidth.toFloat().coerceAtLeast(1f)
+                val availableHeightPx = constraints.maxHeight.toFloat().coerceAtLeast(1f)
+                val screenAspectRatio = screenWidthPx.toFloat() / screenHeightPx.toFloat()
+                val previewWidthPx = min(availableWidthPx, availableHeightPx * screenAspectRatio)
+                val previewHeightPx = previewWidthPx / screenAspectRatio
+                val previewLeftPx = (availableWidthPx - previewWidthPx) / 2f
+                val previewTopPx = (availableHeightPx - previewHeightPx) / 2f
+                val minSizeDp = 16.dp
                 val handleRadiusDp = 14.dp
-                val handleSizeDp = handleRadiusDp * 2
-
-                // 1. Canvas overlay drawing grid lines and selection box
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    // Selection box background with user-configured opacity
-                    drawRect(
-                        color = Color.Red.copy(alpha = overlayOpacity),
-                        topLeft = Offset(rectLeft, rectTop),
-                        size = Size(rectRight - rectLeft, rectBottom - rectTop)
-                    )
-
-                    // Dashed stroke border around selection
-                    drawRect(
-                        color = Color.Red,
-                        topLeft = Offset(rectLeft, rectTop),
-                        size = Size(rectRight - rectLeft, rectBottom - rectTop),
-                        style = Stroke(
-                            width = 2.dp.toPx(),
-                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(16f, 16f), 0f)
-                        )
-                    )
-                }
-
-                // 2. Center Draggable Area (Moves the entire box)
-                val boxWidthDp = with(density) { (rectRight - rectLeft).toDp() }
-                val boxHeightDp = with(density) { (rectBottom - rectTop).toDp() }
-                val boxLeftDp = with(density) { rectLeft.toDp() }
-                val boxTopDp = with(density) { rectTop.toDp() }
+                val boxWidth = with(density) { (previewWidthPx * widthFraction).toDp() }
+                val boxHeight = with(density) { (previewHeightPx * heightFraction).toDp() }
 
                 Box(
                     modifier = Modifier
-                        .offset(x = boxLeftDp, y = boxTopDp)
-                        .size(width = boxWidthDp, height = boxHeightDp)
-                        .pointerInput(containerWidthPx, containerHeightPx) {
+                        .offset {
+                            IntOffset(previewLeftPx.roundToInt(), previewTopPx.roundToInt())
+                        }
+                        .size(
+                            with(density) { previewWidthPx.toDp() },
+                            with(density) { previewHeightPx.toDp() }
+                        )
+                        .background(Color(0xFF151515))
+                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Canvas(Modifier.fillMaxSize()) {
+                        val guideColor = Color.White.copy(alpha = 0.16f)
+                        for (division in 1..2) {
+                            val x = size.width * division / 3f
+                            val y = size.height * division / 3f
+                            drawLine(guideColor, Offset(x, 0f), Offset(x, size.height), 1.dp.toPx())
+                            drawLine(guideColor, Offset(0f, y), Offset(size.width, y), 1.dp.toPx())
+                        }
+                    }
+                    Text(
+                        text = "TOP · STATUS BAR",
+                        modifier = Modifier.align(Alignment.TopCenter).padding(top = 4.dp),
+                        color = Color.White.copy(alpha = 0.65f),
+                        fontSize = 8.sp
+                    )
+                    Text(
+                        text = "BOTTOM · NAVIGATION BAR",
+                        modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 4.dp),
+                        color = Color.White.copy(alpha = 0.65f),
+                        fontSize = 8.sp
+                    )
+                }
+
+                // Interactive Selector Box (Draggable & Resizable)
+                Box(
+                    modifier = Modifier
+                        .offset {
+                            IntOffset(
+                                (previewLeftPx + leftFraction * previewWidthPx).roundToInt(),
+                                (previewTopPx + topFraction * previewHeightPx).roundToInt()
+                            )
+                        }
+                        .size(boxWidth, boxHeight)
+                        .background(
+                            if (isEditMode) Color.Red.copy(alpha = 0.27f) // #44FF0000 preview
+                            else Color.Transparent
+                        )
+                        .border(
+                            width = 2.dp,
+                            color = if (isEditMode) Color.Red else Color.Green,
+                            shape = RoundedCornerShape(4.dp)
+                        )
+                        .pointerInput(Unit) {
+                            // Dragging moves the zone as a fraction of the full screen map.
                             detectDragGestures { change, dragAmount ->
                                 change.consume()
-                                val currentWidth = rectRight - rectLeft
-                                val currentHeight = rectBottom - rectTop
-
-                                var newLeft = rectLeft + dragAmount.x
-                                var newTop = rectTop + dragAmount.y
-
-                                if (newLeft < 0f) newLeft = 0f
-                                if (newLeft + currentWidth > containerWidthPx) {
-                                    newLeft = containerWidthPx - currentWidth
-                                }
-
-                                if (newTop < 0f) newTop = 0f
-                                if (newTop + currentHeight > containerHeightPx) {
-                                    newTop = containerHeightPx - currentHeight
-                                }
-
-                                rectLeft = newLeft
-                                rectTop = newTop
-                                rectRight = newLeft + currentWidth
-                                rectBottom = newTop + currentHeight
+                                leftFraction = (leftFraction + dragAmount.x / previewWidthPx)
+                                    .coerceIn(0f, 1f - widthFraction)
+                                topFraction = (topFraction + dragAmount.y / previewHeightPx)
+                                    .coerceIn(0f, 1f - heightFraction)
                             }
-                        },
-                    contentAlignment = Alignment.Center
+                        }
                 ) {
                     Text(
-                        text = "Touch Block Zone\n(Drag center to move)",
+                        text = if (isEditMode) "Editing Zone\n(Drag center to move)" else "Blocking Active\n(Transparent)",
                         color = Color.White,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium,
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                         modifier = Modifier
-                            .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(6.dp))
+                            .align(Alignment.Center)
+                            .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
                             .padding(horizontal = 8.dp, vertical = 4.dp)
                     )
+
+                    // Bottom-Right Drag Handle (Resizes Width & Height)
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .offset(x = handleRadiusDp / 2, y = handleRadiusDp / 2)
+                            .size(handleRadiusDp * 2)
+                            .shadow(4.dp, CircleShape)
+                            .clip(CircleShape)
+                            .background(Color.White)
+                            .border(3.dp, if (isEditMode) Color.Red else Color.Green, CircleShape)
+                            .pointerInput(Unit) {
+                                detectDragGestures { change, dragAmount ->
+                                    change.consume()
+                                    with(density) {
+                                        // Fractions are relative to the real display, so use
+                                        // display dimensions here rather than the scaled preview.
+                                        val minWidthFraction = minSizeDp.toPx() / screenWidthPx
+                                        val minHeightFraction = minSizeDp.toPx() / screenHeightPx
+                                        widthFraction = (widthFraction + dragAmount.x / previewWidthPx)
+                                            .coerceIn(minWidthFraction, 1f - leftFraction)
+                                        heightFraction = (heightFraction + dragAmount.y / previewHeightPx)
+                                            .coerceIn(minHeightFraction, 1f - topFraction)
+                                    }
+                                }
+                            }
+                    )
                 }
-
-                // 3. Top-Left Drag Handle (Resizes from Top-Left)
-                val handleSizePx = with(density) { handleSizeDp.toPx() }
-                Box(
-                    modifier = Modifier
-                        .offset {
-                            IntOffset(
-                                (rectLeft - handleSizePx / 2f).roundToInt(),
-                                (rectTop - handleSizePx / 2f).roundToInt()
-                            )
-                        }
-                        .size(handleSizeDp)
-                        .shadow(4.dp, CircleShape)
-                        .clip(CircleShape)
-                        .background(Color.White)
-                        .border(3.dp, Color.Red, CircleShape)
-                        .pointerInput(containerWidthPx, containerHeightPx) {
-                            detectDragGestures { change, dragAmount ->
-                                change.consume()
-                                val newLeft = (rectLeft + dragAmount.x).coerceIn(0f, rectRight - minSizePx)
-                                val newTop = (rectTop + dragAmount.y).coerceIn(0f, rectBottom - minSizePx)
-                                rectLeft = newLeft
-                                rectTop = newTop
-                            }
-                        }
-                )
-
-                // 4. Bottom-Right Drag Handle (Resizes from Bottom-Right)
-                Box(
-                    modifier = Modifier
-                        .offset {
-                            IntOffset(
-                                (rectRight - handleSizePx / 2f).roundToInt(),
-                                (rectBottom - handleSizePx / 2f).roundToInt()
-                            )
-                        }
-                        .size(handleSizeDp)
-                        .shadow(4.dp, CircleShape)
-                        .clip(CircleShape)
-                        .background(Color.White)
-                        .border(3.dp, Color.Red, CircleShape)
-                        .pointerInput(containerWidthPx, containerHeightPx) {
-                            detectDragGestures { change, dragAmount ->
-                                change.consume()
-                                val newRight = (rectRight + dragAmount.x).coerceIn(rectLeft + minSizePx, containerWidthPx)
-                                val newBottom = (rectBottom + dragAmount.y).coerceIn(rectTop + minSizePx, containerHeightPx)
-                                rectRight = newRight
-                                rectBottom = newBottom
-                            }
-                        }
-                )
             }
 
             // Bottom UI Control Panel
@@ -392,119 +370,131 @@ fun ZoneSelectorScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    // Slider: Opacity (0% to 50% visibility)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "Overlay Opacity",
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Medium
-                        )
-                        Text(
-                            text = "${(overlayOpacity * 100).roundToInt()}%",
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.primary
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Touch Blocking", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                            Text(
+                                if (isProtectionActive) "Protection is on for this zone"
+                                else "Turn protection on or off",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = isProtectionActive,
+                            enabled = PermissionUtils.hasOverlayPermission(context),
+                            onCheckedChange = { enabled ->
+                                if (enabled) {
+                                    val rect = calculateScreenPixelRect()
+                                    sendZoneToService(rect, editMode = false)
+                                    coroutineScope.launch { repository.setProtectionActive(true) }
+                                } else {
+                                    GhostTouchBlockerService.stop(context)
+                                    coroutineScope.launch { repository.setProtectionActive(false) }
+                                }
+                            }
                         )
                     }
 
-                    Slider(
-                        value = overlayOpacity,
-                        onValueChange = { overlayOpacity = it },
-                        valueRange = 0f..0.50f,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                    Spacer(modifier = Modifier.height(4.dp))
 
-                    // Action Buttons
+                    // Switch Control: "Edit Mode Preview (Red Highlight)"
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // Button: Activate Protection
-                        Button(
-                            onClick = {
-                                if (context is Activity && !PermissionUtils.hasOverlayPermission(context)) {
-                                    PermissionUtils.requestOverlayPermission(context)
-                                    coroutineScope.launch {
-                                        snackbarHostState.showSnackbar("Overlay permission required. Please enable it in Settings.")
-                                    }
-                                    return@Button
-                                }
-
-                                val finalRect = getHardwareRect()
-
-                                val intent = Intent(context, GhostTouchBlockerService::class.java).apply {
-                                    action = GhostTouchBlockerService.ACTION_ADD_ZONE
-                                    putExtra(GhostTouchBlockerService.EXTRA_ZONE_ID, "zone_custom")
-                                    putExtra(GhostTouchBlockerService.EXTRA_ZONE_RECT, finalRect)
-                                    putExtra(GhostTouchBlockerService.EXTRA_ZONE_COLOR, AndroidColor.RED)
-                                    putExtra(GhostTouchBlockerService.EXTRA_ZONE_ALPHA, overlayOpacity)
-                                }
-
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                    context.startForegroundService(intent)
-                                } else {
-                                    context.startService(intent)
-                                }
-
-                                coroutineScope.launch {
-                                    preferences.setBlockerEnabled(true)
-                                    snackbarHostState.showSnackbar("Protection activated for zone: ${finalRect.width()}×${finalRect.height()} px")
-                                }
-                            },
-                            modifier = Modifier.weight(1f),
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                        ) {
-                            Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Activate Protection", fontSize = 13.sp)
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Edit Mode Preview (Red Highlight)",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 14.sp
+                            )
+                            Text(
+                                text = if (isEditMode) "Shows #44FF0000 semi-transparent red overlay"
+                                else "Overlay is completely transparent (Color.TRANSPARENT)",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
-
-                        // Button: Stop Protection
-                        OutlinedButton(
-                            onClick = {
-                                GhostTouchBlockerService.stop(context)
-                                coroutineScope.launch {
-                                    preferences.setBlockerEnabled(false)
-                                    snackbarHostState.showSnackbar("Protection stopped")
+                        Switch(
+                            checked = isEditMode,
+                            onCheckedChange = { checked ->
+                                isEditMode = checked
+                                // If protection is active, update the service overlay appearance immediately
+                                if (isProtectionActive) {
+                                    sendZoneToService(calculateScreenPixelRect(), editMode = checked)
                                 }
-                            },
-                            modifier = Modifier.weight(1f),
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
-                        ) {
-                            Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Stop Protection", fontSize = 13.sp)
-                        }
+                            }
+                        )
                     }
 
-                    // Button: Save Preset Zone
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    // Button: "Apply Protection"
                     Button(
                         onClick = {
-                            val finalRect = getHardwareRect()
+                            val rectPx = calculateScreenPixelRect()
+                            sendZoneToService(rectPx, isEditMode)
                             coroutineScope.launch {
-                                val zone = com.screentouch.touchblocker.data.BlockZone.fromRect(
-                                    id = "zone_preset_${System.currentTimeMillis()}",
-                                    rect = finalRect,
-                                    color = AndroidColor.RED,
-                                    alpha = overlayOpacity
+                                repository.setProtectionActive(true)
+                                snackbarHostState.showSnackbar(
+                                    "Protection applied: [${rectPx.left}, ${rectPx.top}, ${rectPx.right}, ${rectPx.bottom}] px (Edit Mode: $isEditMode)"
                                 )
-                                com.screentouch.touchblocker.data.BlockZoneRepository.getInstance(context).saveZone(zone)
-                                preferences.savePresetZone(finalRect, overlayOpacity)
-                                snackbarHostState.showSnackbar("Preset zone saved (${finalRect.width()}×${finalRect.height()} px)")
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                    ) {
+                        Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Apply Protection", fontSize = 14.sp)
+                    }
+
+                    // Button: "Save & Hide Highlight"
+                    Button(
+                        onClick = {
+                            isEditMode = false
+                            val rectPx = calculateScreenPixelRect()
+                            // Send intent to service with isEditMode = false (completely transparent overlay)
+                            sendZoneToService(rectPx, editMode = false)
+                            coroutineScope.launch {
+                                repository.saveZoneBounds(rectPx, isEditMode = false)
+                                repository.setProtectionActive(true)
+                                snackbarHostState.showSnackbar("Saved! Overlay is now 100% transparent while blocking all touches.")
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
                     ) {
-                        Icon(Icons.Default.Star, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
-                        Text("Save Preset Zone", fontSize = 13.sp)
+                        Text("Save & Hide Highlight (Invisible Mode)", fontSize = 14.sp)
+                    }
+
+                    // Button: "Stop Protection"
+                    if (isProtectionActive) {
+                        OutlinedButton(
+                            onClick = {
+                                GhostTouchBlockerService.stop(context)
+                                coroutineScope.launch {
+                                    repository.setProtectionActive(false)
+                                    snackbarHostState.showSnackbar("Touch protection stopped.")
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Stop Protection", fontSize = 14.sp)
+                        }
                     }
                 }
             }

@@ -3,9 +3,7 @@ package com.screentouch.touchblocker.service
 import android.app.PendingIntent
 import android.content.Intent
 import android.graphics.drawable.Icon
-import android.net.Uri
 import android.os.Build
-import android.provider.Settings
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import android.util.Log
@@ -21,8 +19,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 /**
- * Quick Settings Tile Service allowing users to toggle Ghost Touch Blocker ON/OFF
- * directly from the Android notification shade / Quick Settings panel.
+ * Quick Settings Tile Service allowing users to toggle Touch Blocker ON/OFF
+ * directly from the Android Quick Settings shade.
  */
 class GhostBlockerTileService : TileService() {
 
@@ -39,10 +37,6 @@ class GhostBlockerTileService : TileService() {
         repository = BlockZoneRepository.getInstance(applicationContext)
     }
 
-    /**
-     * Called when the tile becomes visible in the Quick Settings panel.
-     * Starts observing the protection state flow and updates the tile visual state.
-     */
     override fun onStartListening() {
         super.onStartListening()
         listeningJob?.cancel()
@@ -53,21 +47,12 @@ class GhostBlockerTileService : TileService() {
         }
     }
 
-    /**
-     * Called when the tile is no longer visible in the Quick Settings panel.
-     */
     override fun onStopListening() {
         super.onStopListening()
         listeningJob?.cancel()
         listeningJob = null
     }
 
-    /**
-     * Handles Quick Settings Tile clicks:
-     * - If OFF: Validates overlay permission and starts [GhostTouchBlockerService].
-     * - If ON: Stops [GhostTouchBlockerService].
-     * - Updates tile state to [Tile.STATE_ACTIVE] or [Tile.STATE_INACTIVE].
-     */
     override fun onClick() {
         super.onClick()
 
@@ -77,30 +62,33 @@ class GhostBlockerTileService : TileService() {
             if (!isCurrentlyActive) {
                 // Toggling Protection ON
                 if (!PermissionUtils.hasOverlayPermission(this@GhostBlockerTileService)) {
-                    Log.w(TAG, "Overlay permission not granted. Prompting user...")
-                    launchOverlayPermissionScreen()
+                    Log.w(TAG, "Overlay permission not granted. Launching permission settings...")
+                    launchAppActivity()
                     return@launch
                 }
 
-                Log.i(TAG, "Activating Ghost Touch Blocker from Quick Settings Tile.")
+                // Check whether a zone is configured before turning on to prevent accidental lockout
+                val hasZone = repository.hasConfiguredZone.first()
+                if (!hasZone) {
+                    Log.w(TAG, "No block zone configured. Prompting user in app...")
+                    launchAppActivity()
+                    return@launch
+                }
+
+                Log.i(TAG, "Activating Touch Blocker from Quick Settings Tile.")
                 GhostTouchBlockerService.start(applicationContext)
                 repository.setProtectionActive(true)
-
                 updateTileState(true)
             } else {
                 // Toggling Protection OFF
-                Log.i(TAG, "Deactivating Ghost Touch Blocker from Quick Settings Tile.")
+                Log.i(TAG, "Deactivating Touch Blocker from Quick Settings Tile.")
                 GhostTouchBlockerService.stop(applicationContext)
                 repository.setProtectionActive(false)
-
                 updateTileState(false)
             }
         }
     }
 
-    /**
-     * Updates the QS tile label, subtitle, and state.
-     */
     private fun updateTileState(isActive: Boolean) {
         val tile = qsTile ?: return
         tile.state = if (isActive) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
@@ -112,22 +100,14 @@ class GhostBlockerTileService : TileService() {
         tile.updateTile()
     }
 
-    /**
-     * Opens overlay permission settings or main activity when permission is missing.
-     * Uses Android 14 (API 34) compatible startActivityAndCollapse(PendingIntent).
-     */
-    private fun launchOverlayPermissionScreen() {
+    private fun launchAppActivity() {
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            // Android 14+ (API 34) requires PendingIntent for startActivityAndCollapse
             val pendingIntent = PendingIntent.getActivity(
-                this,
-                0,
-                intent,
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                this, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             )
             startActivityAndCollapse(pendingIntent)
         } else {

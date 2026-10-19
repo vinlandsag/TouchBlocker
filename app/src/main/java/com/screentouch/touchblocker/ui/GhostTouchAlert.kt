@@ -127,7 +127,7 @@ fun GhostTouchAlertPopup(
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Text(
-                                text = "Hardware Ghost Spike!",
+                                text = "In-App Ghost Spike Detected!",
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 15.sp,
                                 color = MaterialTheme.colorScheme.error
