@@ -25,10 +25,13 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.TouchBlocker">
 
-        <!-- Main UI Activity -->
+        <!-- Main UI Activity
+             configChanges prevents Activity recreation on rotation, keeping Compose
+             state intact and avoiding spurious service start/stop cycles from the UI. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density"
             android:theme="@style/Theme.TouchBlocker">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
