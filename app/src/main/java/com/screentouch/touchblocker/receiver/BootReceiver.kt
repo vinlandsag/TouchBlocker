@@ -12,75 +12,34 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
-/**
- * BroadcastReceiver triggered on system startup (ACTION_BOOT_COMPLETED).
- * Automatically checks whether touch protection was active prior to shutdown
- * and restores GhostTouchBlockerService with transparent blocking zones.
- */
 class BootReceiver : BroadcastReceiver() {
 
-    companion object {
-        private const val TAG = "BootReceiver"
-    }
-
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == Intent.ACTION_BOOT_COMPLETED ||
-            intent.action == "android.intent.action.QUICKBOOT_POWERON"
-        ) {
-            Log.d(TAG, "Device booted (${intent.action}). Checking touch protection state...")
+        if (intent.action != Intent.ACTION_BOOT_COMPLETED &&
+            intent.action != "android.intent.action.QUICKBOOT_POWERON") return
 
-            val pendingResult = goAsync()
-            val repository = BlockZoneRepository.getInstance(context)
+        val result = goAsync()
+        val repository = BlockZoneRepository.getInstance(context)
 
-            CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    // Check boot preference before restoring protection
-                    val startOnBoot = repository.startOnBoot.first()
-                    if (!startOnBoot) {
-                        Log.i(TAG, "Start on boot disabled. Skipping restoration.")
-                        return@launch
-                    }
-                    val wasProtectionActive = repository.isProtectionActive.first()
-                    val hasOverlayPermission = PermissionUtils.hasOverlayPermission(context)
-
-                    Log.d(TAG, "wasProtectionActive=$wasProtectionActive, hasOverlayPermission=$hasOverlayPermission")
-
-                    if (wasProtectionActive && hasOverlayPermission) {
-                        Log.i(TAG, "Restoring GhostTouchBlockerService with transparent overlay after reboot.")
-
-                        val savedZone = repository.getSavedZone()
-                        if (savedZone != null) {
-                            // Re-apply primary saved zone in transparent mode (isEditMode = false)
-                            GhostTouchBlockerService.applyZone(
-                                context = context.applicationContext,
-                                bounds = savedZone,
-                                isEditMode = false,
-                                zoneId = GhostTouchBlockerService.DEFAULT_ZONE_ID
-                            )
-                        } else {
-                            val savedZones = repository.getEnabledZones()
-                            if (savedZones.isNotEmpty()) {
-                                for (zone in savedZones) {
-                                    GhostTouchBlockerService.applyZone(
-                                        context = context.applicationContext,
-                                        bounds = zone.toRect(),
-                                        isEditMode = false,
-                                        zoneId = zone.id
-                                    )
-                                }
-                            } else {
-                                GhostTouchBlockerService.start(context.applicationContext)
-                            }
-                        }
-                    } else if (wasProtectionActive && !hasOverlayPermission) {
-                        Log.w(TAG, "Cannot restore touch blocker: Overlay permission revoked.")
-                        repository.setProtectionActive(false)
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error restoring touch blocker on boot", e)
-                } finally {
-                    pendingResult.finish()
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                if (!repository.startOnBoot.first()) return@launch
+                if (!repository.isProtectionActive.first()) return@launch
+                if (!PermissionUtils.hasOverlayPermission(context)) {
+                    Log.w("BootReceiver", "Overlay permission revoked; clearing active state.")
+                    repository.setProtectionActive(false)
+                    return@launch
                 }
+                val saved = repository.getSavedZone()
+                if (saved != null) {
+                    GhostTouchBlockerService.applyZone(context.applicationContext, saved, isEditMode = false)
+                } else {
+                    GhostTouchBlockerService.start(context.applicationContext)
+                }
+            } catch (e: Exception) {
+                Log.e("BootReceiver", "Error restoring on boot", e)
+            } finally {
+                result.finish()
             }
         }
     }

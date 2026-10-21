@@ -11,11 +11,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.math.hypot
-import kotlin.math.sqrt
 
-/**
- * Detection states emitted by [GhostTouchDetector].
- */
 sealed interface DetectionState {
     data object Idle : DetectionState
     data class GhostTouchDetected(
@@ -26,146 +22,70 @@ sealed interface DetectionState {
 }
 
 /**
- * Automated ghost touch analysis engine.
- *
- * Maintains a rolling 3-second buffer of touch events and analyzes them using:
- * 1. Spatial clustering with threshold d <= 50px.
- * 2. Spike frequency detection: > 10 ACTION_DOWN events within 1 second without smooth ACTION_MOVE vector.
- * 3. Bounding box computation with a 20px safety padding.
+ * Analyzes a rolling 3-second touch buffer for hardware ghost-touch spikes using:
+ *  1. Spatial clustering (d ≤ 50 px)
+ *  2. Frequency detection (> 10 ACTION_DOWN within 1 s without a smooth move vector)
+ *  3. 20 px padded bounding box output
  */
 class GhostTouchDetector(
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default)
 ) {
-
-    data class TouchPoint(
-        val x: Float,
-        val y: Float,
-        val action: Int,
-        val timestamp: Long = System.currentTimeMillis()
-    )
+    data class TouchPoint(val x: Float, val y: Float, val action: Int, val timestamp: Long = System.currentTimeMillis())
 
     private val mutex = Mutex()
-    private val eventBuffer = ArrayDeque<TouchPoint>()
+    private val buffer = ArrayDeque<TouchPoint>()
 
-    private val _detectionState = MutableStateFlow<DetectionState>(DetectionState.Idle)
-    val detectionState: StateFlow<DetectionState> = _detectionState.asStateFlow()
+    private val _state = MutableStateFlow<DetectionState>(DetectionState.Idle)
+    val detectionState: StateFlow<DetectionState> = _state.asStateFlow()
 
     companion object {
-        private const val ROLLING_WINDOW_MS = 3000L // 3-second rolling window
-        private const val FREQUENCY_WINDOW_MS = 1000L // 1-second spike window
-        private const val MAX_CLUSTER_DISTANCE = 50f // 50px spatial radius
-        private const val MIN_SPIKE_DOWNS = 10 // > 10 ACTION_DOWN events
-        private const val BOUNDING_BOX_PADDING = 20 // 20px margin around cluster
+        private const val WINDOW_MS   = 3000L
+        private const val SPIKE_MS    = 1000L
+        private const val CLUSTER_PX  = 50f
+        private const val MIN_DOWNS   = 10
+        private const val BOX_PADDING = 20
     }
 
-    /**
-     * Records a raw Android [MotionEvent] into the rolling buffer and triggers analysis.
-     */
-    fun recordEvent(event: MotionEvent) {
-        val action = event.actionMasked
-        val x = event.x
-        val y = event.y
-        val timestamp = System.currentTimeMillis()
+    fun recordEvent(event: MotionEvent) =
+        recordPoint(TouchPoint(event.x, event.y, event.actionMasked))
 
-        recordPoint(TouchPoint(x, y, action, timestamp))
-    }
-
-    /**
-     * Records a raw touch point into the rolling buffer.
-     */
     fun recordPoint(point: TouchPoint) {
         scope.launch {
             mutex.withLock {
-                val now = point.timestamp
-                eventBuffer.addLast(point)
-
-                // 1. Maintain rolling buffer over 3-second window
-                val cutoff = now - ROLLING_WINDOW_MS
-                while (eventBuffer.isNotEmpty() && eventBuffer.first().timestamp < cutoff) {
-                    eventBuffer.removeFirst()
-                }
-
-                // Run analysis algorithm on current buffer snapshot
-                analyzeBuffer(eventBuffer.toList())
+                buffer.addLast(point)
+                val cutoff = point.timestamp - WINDOW_MS
+                while (buffer.isNotEmpty() && buffer.first().timestamp < cutoff) buffer.removeFirst()
+                analyze(buffer.toList())
             }
         }
     }
 
-    /**
-     * Core Analysis Algorithm:
-     * - Groups events into spatial clusters where distance d <= 50px.
-     * - Detects frequency spikes (> 10 ACTION_DOWN within 1 second without smooth move vector).
-     * - Computes 20px padded bounding box and emits GhostTouchDetected state.
-     */
-    private fun analyzeBuffer(points: List<TouchPoint>) {
-        if (points.size < MIN_SPIKE_DOWNS) {
-            return
-        }
-
-        // Group points into spatial clusters where d <= 50px
-        val clusters = clusterPoints(points, MAX_CLUSTER_DISTANCE)
-
-        for (cluster in clusters) {
-            // Filter ACTION_DOWN events in this cluster
-            val downEvents = cluster
-                .filter { it.action == MotionEvent.ACTION_DOWN }
-                .sortedBy { it.timestamp }
-
-            if (downEvents.size <= MIN_SPIKE_DOWNS) continue
-
-            // Check if > 10 ACTION_DOWN events occurred within any 1-second sliding window
-            val maxDownsInOneSecond = countMaxEventsInWindow(downEvents, FREQUENCY_WINDOW_MS)
-
-            if (maxDownsInOneSecond > MIN_SPIKE_DOWNS) {
-                // Check whether there is a corresponding smooth ACTION_MOVE vector
-                val moveEvents = cluster.filter { it.action == MotionEvent.ACTION_MOVE }
-                val hasSmoothMoveVector = hasSmoothMoveVector(moveEvents)
-
-                if (!hasSmoothMoveVector) {
-                    // Flag as a Hardware Ghost Spike!
-                    val boundingBox = calculateBoundingBox(cluster, BOUNDING_BOX_PADDING)
-
-                    // Calculate confidence based on spike frequency (11 downs = 0.82 .. 15+ downs = 0.99)
-                    val confidence = (0.75f + (maxDownsInOneSecond - MIN_SPIKE_DOWNS) * 0.05f).coerceIn(0.80f, 0.99f)
-
-                    _detectionState.value = DetectionState.GhostTouchDetected(
-                        rect = boundingBox,
-                        confidence = confidence
-                    )
-                    return
-                }
+    private fun analyze(points: List<TouchPoint>) {
+        if (points.size < MIN_DOWNS) return
+        for (cluster in clusterPoints(points)) {
+            val downs = cluster.filter { it.action == MotionEvent.ACTION_DOWN }.sortedBy { it.timestamp }
+            if (downs.size <= MIN_DOWNS) continue
+            if (maxInWindow(downs, SPIKE_MS) > MIN_DOWNS && !hasSmoothMove(cluster.filter { it.action == MotionEvent.ACTION_MOVE })) {
+                val confidence = (0.75f + (maxInWindow(downs, SPIKE_MS) - MIN_DOWNS) * 0.05f).coerceIn(0.80f, 0.99f)
+                _state.value = DetectionState.GhostTouchDetected(boundingBox(cluster), confidence)
+                return
             }
         }
     }
 
-    /**
-     * Groups points into clusters using spatial proximity:
-     * Two points belong to the same cluster if distance <= [maxDistance].
-     */
-    private fun clusterPoints(points: List<TouchPoint>, maxDistance: Float): List<List<TouchPoint>> {
+    private fun clusterPoints(points: List<TouchPoint>): List<List<TouchPoint>> {
         val visited = BooleanArray(points.size)
         val clusters = mutableListOf<List<TouchPoint>>()
-
         for (i in points.indices) {
             if (visited[i]) continue
             val cluster = mutableListOf<TouchPoint>()
-            val queue = ArrayDeque<Int>()
-            queue.add(i)
+            val queue = ArrayDeque<Int>().also { it.add(i) }
             visited[i] = true
-
             while (queue.isNotEmpty()) {
-                val currIdx = queue.removeFirst()
-                val curr = points[currIdx]
-                cluster.add(curr)
-
+                val curr = queue.removeFirst().also { cluster.add(points[it]) }
                 for (j in points.indices) {
-                    if (!visited[j]) {
-                        val other = points[j]
-                        val dist = hypot(curr.x - other.x, curr.y - other.y)
-                        if (dist <= maxDistance) {
-                            visited[j] = true
-                            queue.add(j)
-                        }
+                    if (!visited[j] && hypot(points[curr].x - points[j].x, points[curr].y - points[j].y) <= CLUSTER_PX) {
+                        visited[j] = true; queue.add(j)
                     }
                 }
             }
@@ -174,86 +94,30 @@ class GhostTouchDetector(
         return clusters
     }
 
-    /**
-     * Counts the maximum number of events occurring inside any sliding [windowMs] interval.
-     */
-    private fun countMaxEventsInWindow(sortedEvents: List<TouchPoint>, windowMs: Long): Int {
-        var maxCount = 0
-        var windowStart = 0
-
-        for (windowEnd in sortedEvents.indices) {
-            val endTime = sortedEvents[windowEnd].timestamp
-            while (sortedEvents[windowStart].timestamp < endTime - windowMs) {
-                windowStart++
-            }
-            val currentCount = windowEnd - windowStart + 1
-            if (currentCount > maxCount) {
-                maxCount = currentCount
-            }
+    private fun maxInWindow(sorted: List<TouchPoint>, windowMs: Long): Int {
+        var max = 0; var start = 0
+        for (end in sorted.indices) {
+            while (sorted[start].timestamp < sorted[end].timestamp - windowMs) start++
+            if (end - start + 1 > max) max = end - start + 1
         }
-        return maxCount
+        return max
     }
 
-    /**
-     * Evaluates whether a set of ACTION_MOVE events forms a coherent, smooth human drag vector.
-     * True if moves show progressive displacement and consistent direction;
-     * False if moves are non-existent, static jitter, or erratic hardware noise.
-     */
-    private fun hasSmoothMoveVector(moveEvents: List<TouchPoint>): Boolean {
-        if (moveEvents.size < 4) return false
-
-        var totalDisplacement = 0f
-        var directionalConsistency = 0
-
-        for (i in 1 until moveEvents.size) {
-            val p0 = moveEvents[i - 1]
-            val p1 = moveEvents[i]
-            val dx = p1.x - p0.x
-            val dy = p1.y - p0.y
-            val stepDist = hypot(dx, dy)
-            totalDisplacement += stepDist
-
-            if (stepDist > 4f) {
-                directionalConsistency++
-            }
+    private fun hasSmoothMove(moves: List<TouchPoint>): Boolean {
+        if (moves.size < 4) return false
+        var total = 0f; var consistent = 0
+        for (i in 1 until moves.size) {
+            val d = hypot(moves[i].x - moves[i-1].x, moves[i].y - moves[i-1].y)
+            total += d; if (d > 4f) consistent++
         }
-
-        // A smooth human drag has noticeable cumulative displacement and progressive trajectory
-        return totalDisplacement > 40f && directionalConsistency >= 3
+        return total > 40f && consistent >= 3
     }
 
-    /**
-     * Calculates the bounding box around a cluster with [padding] margin.
-     */
-    private fun calculateBoundingBox(cluster: List<TouchPoint>, padding: Int): Rect {
-        val minX = cluster.minOf { it.x }.toInt()
-        val minY = cluster.minOf { it.y }.toInt()
-        val maxX = cluster.maxOf { it.x }.toInt()
-        val maxY = cluster.maxOf { it.y }.toInt()
-
-        return Rect(
-            (minX - padding).coerceAtLeast(0),
-            (minY - padding).coerceAtLeast(0),
-            maxX + padding,
-            maxY + padding
-        )
+    private fun boundingBox(cluster: List<TouchPoint>): Rect {
+        val minX = cluster.minOf { it.x }.toInt(); val minY = cluster.minOf { it.y }.toInt()
+        val maxX = cluster.maxOf { it.x }.toInt(); val maxY = cluster.maxOf { it.y }.toInt()
+        return Rect((minX - BOX_PADDING).coerceAtLeast(0), (minY - BOX_PADDING).coerceAtLeast(0), maxX + BOX_PADDING, maxY + BOX_PADDING)
     }
 
-    /**
-     * Resets the detection state back to [DetectionState.Idle].
-     */
-    fun resetState() {
-        _detectionState.value = DetectionState.Idle
-    }
-
-    /**
-     * Clears all recorded touch events from the rolling buffer.
-     */
-    fun clearBuffer() {
-        scope.launch {
-            mutex.withLock {
-                eventBuffer.clear()
-            }
-        }
-    }
+    fun resetState() { _state.value = DetectionState.Idle }
 }

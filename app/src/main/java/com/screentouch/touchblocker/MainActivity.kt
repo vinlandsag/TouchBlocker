@@ -72,10 +72,9 @@ class MainActivity : ComponentActivity() {
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* Notification permission result handled */ }
+    ) { }
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        // Stream in-app motion events to heuristic detector
         detector.recordEvent(ev)
         return super.dispatchTouchEvent(ev)
     }
@@ -83,34 +82,24 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Request POST_NOTIFICATIONS permission for Android 13+ (API 33+)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.POST_NOTIFICATIONS
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
         setContent {
             MaterialTheme {
-                var currentScreen by remember { mutableStateOf("home") }
-
-                Column(modifier = Modifier.fillMaxSize()) {
-                    // Popup alert displayed when in-app ghost touch anomaly is detected
+                var screen by remember { mutableStateOf("home") }
+                Column(Modifier.fillMaxSize()) {
                     GhostTouchAlertPopup(detector = detector)
-
-                    if (currentScreen == "zone_selector") {
-                        ZoneSelectorScreen(
-                            onNavigateBack = { currentScreen = "home" }
-                        )
+                    if (screen == "zone_selector") {
+                        ZoneSelectorScreen(onNavigateBack = { screen = "home" })
                     } else {
                         TouchBlockerScreen(
                             activity = this@MainActivity,
                             detector = detector,
-                            onOpenZoneSelector = { currentScreen = "zone_selector" }
+                            onOpenZoneSelector = { screen = "zone_selector" }
                         )
                     }
                 }
@@ -127,71 +116,49 @@ fun TouchBlockerScreen(
     onOpenZoneSelector: () -> Unit = {}
 ) {
     val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
+    val scope = rememberCoroutineScope()
     val repository = remember { BlockZoneRepository.getInstance(context) }
 
-    val isBlockerActive by repository.isProtectionActive.collectAsState(initial = false)
+    val isActive by repository.isProtectionActive.collectAsState(initial = false)
     val startOnBoot by repository.startOnBoot.collectAsState(initial = false)
-    val hasConfiguredZone by repository.hasConfiguredZone.collectAsState(initial = false)
+    val hasZone by repository.hasConfiguredZone.collectAsState(initial = false)
     val savedBounds by repository.savedBoundsFlow.collectAsState(initial = null)
 
-    var hasOverlayPermission by remember {
-        mutableStateOf(PermissionUtils.hasOverlayPermission(context))
-    }
-
+    var hasOverlay by remember { mutableStateOf(PermissionUtils.hasOverlayPermission(context)) }
     var showNoZoneDialog by remember { mutableStateOf(false) }
 
-    // Refresh overlay permission status when resuming the activity
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                hasOverlayPermission = PermissionUtils.hasOverlayPermission(context)
-            }
+            if (event == Lifecycle.Event.ON_RESUME) hasOverlay = PermissionUtils.hasOverlayPermission(context)
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-        }
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Confirmation dialog when attempting to activate protection with no zone configured
     if (showNoZoneDialog) {
         AlertDialog(
             onDismissRequest = { showNoZoneDialog = false },
-            icon = { Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
+            icon = { Icon(Icons.Default.Warning, null, tint = MaterialTheme.colorScheme.error) },
             title = { Text("No Block Zone Configured") },
             text = {
                 Text(
-                    "To prevent accidental screen lockouts, you should configure a specific touch block zone first.\n\n" +
-                            "Would you like to configure a zone now, or explicitly block the entire screen? (An emergency stop action remains accessible in your notifications)."
+                    "To prevent accidental screen lockouts, configure a specific touch block zone first.\n\n" +
+                    "Configure a zone now, or explicitly block the entire screen? " +
+                    "(An emergency stop remains in your notifications.)"
                 )
             },
             confirmButton = {
-                Button(
-                    onClick = {
-                        showNoZoneDialog = false
-                        onOpenZoneSelector()
-                    }
-                ) {
-                    Text("Configure Zone")
-                }
+                Button(onClick = { showNoZoneDialog = false; onOpenZoneSelector() }) { Text("Configure Zone") }
             },
             dismissButton = {
                 Row {
-                    TextButton(
-                        onClick = {
-                            showNoZoneDialog = false
-                            // User explicitly confirmed full-screen touch blocking
-                            GhostTouchBlockerService.start(context, confirmFullScreen = true)
-                            coroutineScope.launch { repository.setProtectionActive(true) }
-                        }
-                    ) {
-                        Text("Block Full Screen", color = MaterialTheme.colorScheme.error)
-                    }
-                    TextButton(onClick = { showNoZoneDialog = false }) {
-                        Text("Cancel")
-                    }
+                    TextButton(onClick = {
+                        showNoZoneDialog = false
+                        GhostTouchBlockerService.start(context, confirmFullScreen = true)
+                        scope.launch { repository.setProtectionActive(true) }
+                    }) { Text("Block Full Screen", color = MaterialTheme.colorScheme.error) }
+                    TextButton(onClick = { showNoZoneDialog = false }) { Text("Cancel") }
                 }
             }
         )
@@ -207,226 +174,138 @@ fun TouchBlockerScreen(
                 )
             )
         }
-    ) { paddingValues ->
+    ) { padding ->
         Column(
-            modifier = Modifier
+            Modifier
                 .fillMaxSize()
-                .padding(paddingValues)
+                .padding(padding)
                 .padding(horizontal = 20.dp, vertical = 16.dp)
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Permission Status Card
+            // Permission card
             Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = if (hasOverlayPermission)
-                        MaterialTheme.colorScheme.secondaryContainer
-                    else
-                        MaterialTheme.colorScheme.errorContainer
+                Modifier.fillMaxWidth(), RoundedCornerShape(16.dp),
+                CardDefaults.cardColors(
+                    containerColor = if (hasOverlay) MaterialTheme.colorScheme.secondaryContainer
+                    else MaterialTheme.colorScheme.errorContainer
                 )
             ) {
-                Column(modifier = Modifier.padding(16.dp)) {
+                Column(Modifier.padding(16.dp)) {
                     Text(
-                        text = if (hasOverlayPermission) "Overlay Permission: Granted" else "Overlay Permission: Required",
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 15.sp
+                        if (hasOverlay) "Overlay Permission: Granted" else "Overlay Permission: Required",
+                        fontWeight = FontWeight.SemiBold, fontSize = 15.sp
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(Modifier.height(4.dp))
                     Text(
-                        text = if (hasOverlayPermission)
-                            "The app has permission to render the touch-blocking overlay."
-                        else
-                            "Overlay permission (SYSTEM_ALERT_WINDOW) is mandatory to block ghost and accidental touches.",
+                        if (hasOverlay) "The app can render the touch-blocking overlay."
+                        else "SYSTEM_ALERT_WINDOW is required to block ghost and accidental touches.",
                         fontSize = 13.sp
                     )
-                    if (!hasOverlayPermission) {
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Button(onClick = { PermissionUtils.requestOverlayPermission(activity) }) {
-                            Text("Grant Permission")
-                        }
+                    if (!hasOverlay) {
+                        Spacer(Modifier.height(10.dp))
+                        Button(onClick = { PermissionUtils.requestOverlayPermission(activity) }) { Text("Grant Permission") }
                     }
                 }
             }
 
-            // Blocker Switch Card (Single Source of Truth)
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(20.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
+            // Blocker toggle card
+            Card(Modifier.fillMaxWidth(), RoundedCornerShape(16.dp),
+                CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                Row(Modifier.fillMaxWidth().padding(20.dp), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Touch Blocker Service", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                        Spacer(Modifier.height(4.dp))
                         Text(
-                            text = "Touch Blocker Service",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 16.sp
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = if (isBlockerActive) "Active (Blocking screen touches)" else "Disabled",
+                            if (isActive) "Active (Blocking screen touches)" else "Disabled",
                             fontSize = 13.sp,
-                            color = if (isBlockerActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            color = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        if (savedBounds != null) {
-                            Text(
-                                text = "Zone: [${savedBounds!!.left}, ${savedBounds!!.top}, ${savedBounds!!.right}, ${savedBounds!!.bottom}] px",
-                                fontSize = 11.sp,
-                                fontFamily = FontFamily.Monospace,
-                                color = MaterialTheme.colorScheme.outline
-                            )
+                        savedBounds?.let {
+                            Text("Zone: [${it.left}, ${it.top}, ${it.right}, ${it.bottom}] px",
+                                fontSize = 11.sp, fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.outline)
                         }
                     }
                     Switch(
-                        checked = isBlockerActive,
-                        enabled = hasOverlayPermission,
-                        onCheckedChange = { enable ->
-                            if (enable) {
-                                if (!hasConfiguredZone) {
-                                    // Prevent accidental full screen blocking
-                                    showNoZoneDialog = true
-                                } else {
-                                    GhostTouchBlockerService.start(context)
-                                    coroutineScope.launch { repository.setProtectionActive(true) }
-                                }
+                        checked = isActive,
+                        enabled = hasOverlay,
+                        onCheckedChange = { on ->
+                            if (on) {
+                                if (!hasZone) showNoZoneDialog = true
+                                else { GhostTouchBlockerService.start(context); scope.launch { repository.setProtectionActive(true) } }
                             } else {
                                 GhostTouchBlockerService.stop(context)
-                                coroutineScope.launch { repository.setProtectionActive(false) }
+                                scope.launch { repository.setProtectionActive(false) }
                             }
                         }
                     )
                 }
             }
 
-            // Start on Device Boot Setting Card
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(20.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "Start on Device Boot",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 16.sp
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "Restore saved protection zones automatically after system reboot",
-                            fontSize = 13.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+            // Boot toggle card
+            Card(Modifier.fillMaxWidth(), RoundedCornerShape(16.dp),
+                CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                Row(Modifier.fillMaxWidth().padding(20.dp), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Start on Device Boot", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                        Spacer(Modifier.height(4.dp))
+                        Text("Restore saved zone automatically after reboot",
+                            fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    Switch(
-                        checked = startOnBoot,
-                        onCheckedChange = { enable ->
-                            coroutineScope.launch {
-                                repository.setStartOnBoot(enable)
-                            }
-                        }
-                    )
+                    Switch(checked = startOnBoot, onCheckedChange = { scope.launch { repository.setStartOnBoot(it) } })
                 }
             }
 
-            // In-App Touch Heuristic Info Card
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-            ) {
-                Row(
-                    modifier = Modifier.padding(16.dp),
-                    verticalAlignment = Alignment.Top
-                ) {
-                    Icon(
-                        Icons.Default.Info,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(20.dp)
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
+            // Ghost touch info card
+            Card(Modifier.fillMaxWidth(), RoundedCornerShape(16.dp),
+                CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.Top) {
+                    Icon(Icons.Default.Info, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(10.dp))
                     Column {
+                        Text("In-App Ghost Touch Diagnostic", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                        Spacer(Modifier.height(2.dp))
                         Text(
-                            text = "In-App Ghost Touch Diagnostic",
-                            fontWeight = FontWeight.SemiBold,
-                            fontSize = 14.sp
-                        )
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = "Analyzes touch input patterns while interacting within this app to detect hardware digitizer jitter and water-droplet anomalies. Touch monitoring is an in-app heuristic; Android security prevents apps from capturing touches globally outside their own windows.",
-                            fontSize = 12.sp,
-                            lineHeight = 16.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            "Analyzes touch patterns while interacting within this app to detect digitizer jitter and water-droplet anomalies. " +
+                            "Note: Android security prevents apps from capturing touches outside their own windows.",
+                            fontSize = 12.sp, lineHeight = 16.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
             }
 
-            // Configure Custom Block Zone Button
-            Button(
-                onClick = onOpenZoneSelector,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(8.dp))
+            Button(onClick = onOpenZoneSelector, Modifier.fillMaxWidth()) {
+                Icon(Icons.Default.Lock, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
                 Text("Configure Block Zone Coordinates")
             }
 
-            // DEBUG ONLY: Ghost Touch Simulation Button
             if (BuildConfig.DEBUG) {
                 OutlinedButton(
                     onClick = {
-                        coroutineScope.launch {
-                            val baseX = 350f
-                            val baseY = 650f
+                        scope.launch {
                             val now = System.currentTimeMillis()
-                            // Generates 12 rapid ACTION_DOWN pulses within 40px radius over 300ms
-                            for (i in 0..11) {
-                                val jitterX = baseX + ((-15..15).random())
-                                val jitterY = baseY + ((-15..15).random())
-                                detector.recordPoint(
-                                    GhostTouchDetector.TouchPoint(
-                                        x = jitterX,
-                                        y = jitterY,
-                                        action = MotionEvent.ACTION_DOWN,
-                                        timestamp = now + (i * 25L)
-                                    )
-                                )
+                            repeat(12) { i ->
+                                detector.recordPoint(GhostTouchDetector.TouchPoint(
+                                    x = 350f + (-15..15).random(),
+                                    y = 650f + (-15..15).random(),
+                                    action = android.view.MotionEvent.ACTION_DOWN,
+                                    timestamp = now + i * 25L
+                                ))
                             }
                         }
                     },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("[Debug Build] Simulate Ghost Touch Spike")
-                }
+                    Modifier.fillMaxWidth()
+                ) { Text("[Debug] Simulate Ghost Touch Spike") }
             }
 
-            // Emergency Stop Blocker
-            if (isBlockerActive) {
+            if (isActive) {
                 Button(
-                    onClick = {
-                        GhostTouchBlockerService.stop(context)
-                        coroutineScope.launch { repository.setProtectionActive(false) }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
+                    onClick = { GhostTouchBlockerService.stop(context); scope.launch { repository.setProtectionActive(false) } },
+                    Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                ) {
-                    Text("Emergency Stop Blocker")
-                }
+                ) { Text("Emergency Stop Blocker") }
             }
         }
     }

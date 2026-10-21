@@ -1,10 +1,7 @@
 package com.screentouch.touchblocker.ui
 
 import android.app.Activity
-import android.content.Context
-import android.graphics.Color as AndroidColor
 import android.graphics.Rect
-import android.os.Build
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -94,7 +91,7 @@ fun GhostTouchAlertPopup(
 
                         // Automatically add zone to GhostTouchBlockerService
                         val zoneId = "ghost_spike_${System.currentTimeMillis()}"
-                        GhostTouchBlockerService.addZone(context, zoneId, rect)
+                        GhostTouchBlockerService.applyZone(context, rect, isEditMode = false, zoneId = zoneId)
 
                         detector.resetState()
                         onZoneBlocked?.invoke(rect)
